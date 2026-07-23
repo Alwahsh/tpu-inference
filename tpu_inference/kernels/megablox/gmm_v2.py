@@ -360,6 +360,219 @@ def generate_block_specs(
 
 
 # Define kernels.
+#
+# The building blocks below (compute_local_row_bounds, matmul_tile,
+# mask_out_of_group_rows, store_output_tile) are shared with the fused MoE
+# FFN kernel in gmm_fused.py, which relies on them producing the exact same
+# op sequence as this kernel: keep any change to them bitwise-neutral or
+# update gmm_fused's equivalence tests accordingly.
+
+
+def compute_local_row_bounds(metadata_ref: MetadataRef, gm_id: jax.Array,
+                             sublane: int) -> tuple[jax.Array, jax.Array]:
+    """Returns this gm tile's group row window, relative to the tile.
+
+    The tile's lhs/out refs are windowed to whole sublanes, so the rows
+    [m_start, m_end) owned by the tile's group map to local rows
+    [m_start_local, m_end_local) within the tile.
+    """
+    m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+    m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+    m_offset = m_start - m_start % sublane
+
+    return m_start - m_offset, m_end - m_offset
+
+
+def matmul_tile(
+    tiled_lhs: jax.Array,  # [rows, tile_k], rows = tile_m or a bucket
+    tiled_rhs_ref: RhsRef,  # [tile_k, tile_n] (+ optional scale/bias)
+    *,
+    cfgs: GmmConfigs,
+    is_last_k_step: bool,
+) -> jax.Array:
+    """Single-tile matmul body: lhs (de)quantization, MXU loop, rhs scale.
+
+    Returns the [rows, rhs_tile_n] accumulator in cfgs.acc_dtype. When
+    tiled_rhs_ref is a FusedWeightsRef, the returned accumulator columns
+    are lane-interleaved gate/up (see interleave_lane); apply_act_fn
+    deinterleaves them.
+    """
+    tpu_info = pltpu.get_tpu_info()
+    mxu_size = tpu_info.mxu_column_size
+    rows = tiled_lhs.shape[0]
+
+    # Step 1: Input pre-processing.
+    tiled_rhs = tiled_rhs_ref.get_weight()
+
+    # This should only be taken in the case where we don't requantize
+    # the scales and thus we need to dequantize inside VMEM to avoid small
+    # contracting dimmensions
+    rhs_tile_n = tiled_rhs.shape[1]
+    rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+    if cfgs.rhs_cfgs.should_dequantize_before_matmul:
+        tiled_rhs_scale = tiled_rhs_ref.get_scale(
+            replicate_size=rhs_qbs).astype(cfgs.lhs_cfgs.dtype)
+        num_blocks = cfgs.num_quant_blocks_per_tile_k
+        tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
+            num_blocks, rhs_qbs, rhs_tile_n)
+        tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
+        tiled_rhs = tiled_rhs_dequant.reshape(cfgs.tiles.tile_k, rhs_tile_n)
+        rhs_qbs = cfgs.tiles.tile_k
+
+    valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
+    if is_last_k_step and valid_k != 0:
+        mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape,
+                                        0) < valid_k
+        tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+
+    # Step 2: Matmul.
+    acc_list = []
+    if not cfgs.lhs_cfgs.should_quantize:
+        # Unquantized matmul path.
+        for start_n in range(0, rhs_tile_n, mxu_size):
+            end_n = min(rhs_tile_n, start_n + mxu_size)
+            col_size = end_n - start_n
+
+            acc_n = jnp.zeros((rows, col_size), dtype=cfgs.acc_dtype)
+            for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
+                end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
+
+                block_acc = jnp.matmul(
+                    tiled_lhs[:, start_k:end_k],
+                    tiled_rhs[start_k:end_k, start_n:end_n],
+                    preferred_element_type=jnp.float32,
+                ).astype(cfgs.acc_dtype)
+
+                if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    b_id = start_k // rhs_qbs
+                    rhs_scale_replicated = tiled_rhs_ref.get_scale(
+                        replicate_size=rows)[b_id, :,
+                                             start_n:start_n + col_size]
+                    block_acc *= rhs_scale_replicated.astype(cfgs.acc_dtype)
+
+                acc_n += block_acc
+            acc_list.append(acc_n)
+    else:
+        # Quantized matmul path.
+        lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
+        q_block_size = cfgs.lhs_cfgs.quant_block_size
+
+        if jnp.issubdtype(lhs_q_dtype, jnp.floating):
+            dtype_max = float(jnp.finfo(lhs_q_dtype).max)
+            preferred_element_type = jnp.float32
+        else:
+            dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
+            preferred_element_type = jnp.int32
+
+        # Without n outer loop, result of quantized matmul becomes available only
+        # at the last iteration of the loop. This means [tile_m, tile_n] value
+        # needs to be stored until the last iteration. By adding n outer loop,
+        # result of [tile_m, mxu_size] becomes available at the end of every k
+        # inner loop which can be used to pipeline subsequent VPU or VST ops with
+        # MXU ops for the next [tile_m, mxu_size].
+        for start_n in range(0, rhs_tile_n, mxu_size):
+            end_n = min(rhs_tile_n, start_n + mxu_size)
+            col_size = end_n - start_n
+
+            acc_n = jnp.zeros((rows, col_size), dtype=cfgs.acc_dtype)
+            for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
+                end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
+
+                block_lhs = tiled_lhs[:, start_k:end_k]
+                block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+
+                # Perform lhs quantization. Note that for every block_lhs,
+                # same computation will be performed tiles_n//mxu_size times.
+                # But we can let compiler perform CSE and avoid recomputation.
+                block_abs_max = jnp.max(jnp.abs(block_lhs),
+                                        axis=1,
+                                        keepdims=True)
+                block_scale = block_abs_max / dtype_max
+
+                # If block_scale=0, it will cause division by zero and return either
+                # NaN or Inf. Since this can cause numeric issue when downcasting to
+                # quantized value, we convert them into 0.
+                block_scale_inv = jnp.where(block_scale == 0, 0,
+                                            1 / block_scale)
+                # Convert lhs into quantized dtype.
+                block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+
+                # Unlike unquantized path, compiler may not perform implicit type
+                # conversion due to numeric concerns. As this can cause unsupported
+                # matmul error, explicit type conversion is performed.
+                if not tpu_info.is_matmul_supported(lhs_q_dtype,
+                                                    block_rhs.dtype):
+                    block_rhs = block_rhs.astype(lhs_q_dtype)
+
+                block_acc = jnp.matmul(
+                    block_lhs_q,
+                    block_rhs,
+                    preferred_element_type=preferred_element_type,
+                ).astype(cfgs.acc_dtype)
+
+                block_acc *= block_scale.astype(cfgs.acc_dtype)
+
+                # Apply rhs subchannel scale per quant block.
+                if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    b_id = start_k // rhs_qbs
+                    rhs_scale_replicated = tiled_rhs_ref.get_scale(
+                        replicate_size=rows)[b_id, :,
+                                             start_n:start_n + col_size]
+                    block_acc *= rhs_scale_replicated.astype(cfgs.acc_dtype)
+
+                acc_n += block_acc
+            acc_list.append(acc_n)
+    return jnp.concatenate(acc_list, axis=1)
+
+
+def mask_out_of_group_rows(acc: jax.Array, m_start_local: jax.Array,
+                           m_end_local: jax.Array) -> jax.Array:
+    """Zeroes rows that do not belong to the current tile's group."""
+    iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+    mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+    return jnp.where(mask, acc, 0)
+
+
+def store_output_tile(
+    acc_masked: jax.Array,  # [rows, tile_n], out-of-group rows zeroed
+    tiled_out_ref: jax.Array,  # [tile_m // sublane, sublane, tile_n]
+    partial_out_ref: jax.Array,  # [sublane, tile_n]
+    gm_id: jax.Array,
+    m_end_local: jax.Array,
+    *,
+    sublane: int,
+):
+    """Writes a tile's masked output, accumulating shared boundary sublanes."""
+    # Write the final output to the output ref.
+    tiled_out_2d_ref = tiled_out_ref.reshape(-1, acc_masked.shape[-1])
+    tiled_out_2d_ref[:acc_masked.shape[0]] = acc_masked.astype(
+        tiled_out_ref.dtype)
+
+    # If this is the first tile for grid[n_id, :, :], we initialize the
+    # partial out to zeros. Otherwise, partial out from last tile of
+    # grid[n_id-1, :, :] can be used and cause numeric issues.
+    partial_out_zeros = jnp.zeros_like(partial_out_ref)
+
+    # Accumulate the partial output from the previous step.
+    tiled_out_ref[0] += jnp.where(gm_id == 0, partial_out_zeros,
+                                  partial_out_ref[...])
+
+    # Consider following case where size_lhs_sublane = 4, number denotes group
+    # id and | denotes boundaries between sublanes:
+    # | 0 0 1 2 | 2 2 2 2 | 3 3 4 4 |
+    #
+    # Assuming group id of current step is 1, current step will not completely
+    # fill size_lhs_sublane rows and will be revisited at the next step. By
+    # storing the partial rows into the partial_out_ref, the next step can
+    # read them and accumulate to them.  Additionally, for group id of 2,
+    # since it completely fills the size_lhs_sublane rows, we need to zero out
+    # partial_out_ref to avoid numeric error for group 3.
+    last_row = m_end_local // sublane
+    partial_out_ref[...] = jnp.where(
+        m_end_local % sublane == 0,
+        partial_out_zeros,
+        tiled_out_ref[last_row],
+    )
 
 
 def inner_kernel(
@@ -398,144 +611,17 @@ def inner_kernel(
     """
 
     gm_id = pl.program_id(1)
-    m_start = metadata_ref.gm_id_to_m_offset[gm_id]
-    m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
-    m_offset = m_start - m_start % cfgs.dims.size_lhs_sublane
-
-    m_start_local = m_start - m_offset
-    m_end_local = m_end - m_offset
+    m_start_local, m_end_local = compute_local_row_bounds(
+        metadata_ref, gm_id, cfgs.dims.size_lhs_sublane)
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
-        tpu_info = pltpu.get_tpu_info()
-        mxu_size = tpu_info.mxu_column_size
-
-        # Step 1: Input pre-processing.
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
-        tiled_rhs = tiled_rhs_ref.get_weight()
+        acc = matmul_tile(tiled_lhs,
+                          tiled_rhs_ref,
+                          cfgs=cfgs,
+                          is_last_k_step=is_last_k_step)
 
-        # This should only be taken in the case where we don't requantize
-        # the scales and thus we need to dequantize inside VMEM to avoid small
-        # contracting dimmensions
-        rhs_tile_n = tiled_rhs.shape[1]
-        rhs_qbs = cfgs.rhs_cfgs.quant_block_size
-        if cfgs.rhs_cfgs.should_dequantize_before_matmul:
-            tiled_rhs_scale = tiled_rhs_ref.get_scale(
-                replicate_size=rhs_qbs).astype(cfgs.lhs_cfgs.dtype)
-            num_blocks = cfgs.num_quant_blocks_per_tile_k
-            tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
-                num_blocks, rhs_qbs, rhs_tile_n)
-            tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
-            tiled_rhs = tiled_rhs_dequant.reshape(cfgs.tiles.tile_k,
-                                                  rhs_tile_n)
-            rhs_qbs = cfgs.tiles.tile_k
-
-        valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
-        if is_last_k_step and valid_k != 0:
-            mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape,
-                                            0) < valid_k
-            tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
-
-        # Step 2: Matmul.
-        acc_list = []
-        if not cfgs.lhs_cfgs.should_quantize:
-            # Unquantized matmul path.
-            for start_n in range(0, rhs_tile_n, mxu_size):
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
-
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
-                    end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
-
-                    block_acc = jnp.matmul(
-                        tiled_lhs[:, start_k:end_k],
-                        tiled_rhs[start_k:end_k, start_n:end_n],
-                        preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
-
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m)[b_id, :, start_n:start_n +
-                                                     col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
-
-                    acc_n += block_acc
-                acc_list.append(acc_n)
-        else:
-            # Quantized matmul path.
-            lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
-            q_block_size = cfgs.lhs_cfgs.quant_block_size
-
-            if jnp.issubdtype(lhs_q_dtype, jnp.floating):
-                dtype_max = float(jnp.finfo(lhs_q_dtype).max)
-                preferred_element_type = jnp.float32
-            else:
-                dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
-                preferred_element_type = jnp.int32
-
-            # Without n outer loop, result of quantized matmul becomes available only
-            # at the last iteration of the loop. This means [tile_m, tile_n] value
-            # needs to be stored until the last iteration. By adding n outer loop,
-            # result of [tile_m, mxu_size] becomes available at the end of every k
-            # inner loop which can be used to pipeline subsequent VPU or VST ops with
-            # MXU ops for the next [tile_m, mxu_size].
-            for start_n in range(0, rhs_tile_n, mxu_size):
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
-
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
-                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-
-                    block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
-
-                    # Perform lhs quantization. Note that for every block_lhs,
-                    # same computation will be performed tiles_n//mxu_size times.
-                    # But we can let compiler perform CSE and avoid recomputation.
-                    block_abs_max = jnp.max(jnp.abs(block_lhs),
-                                            axis=1,
-                                            keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0,
-                                                1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs *
-                                   block_scale_inv).astype(lhs_q_dtype)
-
-                    # Unlike unquantized path, compiler may not perform implicit type
-                    # conversion due to numeric concerns. As this can cause unsupported
-                    # matmul error, explicit type conversion is performed.
-                    if not tpu_info.is_matmul_supported(
-                            lhs_q_dtype, block_rhs.dtype):
-                        block_rhs = block_rhs.astype(lhs_q_dtype)
-
-                    block_acc = jnp.matmul(
-                        block_lhs_q,
-                        block_rhs,
-                        preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
-
-                    block_acc *= block_scale.astype(acc_ref.dtype)
-
-                    # Apply rhs subchannel scale per quant block.
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m)[b_id, :, start_n:start_n +
-                                                     col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
-
-                    acc_n += block_acc
-                acc_list.append(acc_n)
-        acc = jnp.concatenate(acc_list, axis=1)
-
-        # Step 3: Output post-processing.
+        # Output post-processing.
         if not is_first_k_step:
             acc = jnp.pad(acc, ((cfgs.tiles.tile_m - bucket_m, 0), (0, 0)))
             acc += acc_ref[...]
@@ -547,41 +633,14 @@ def inner_kernel(
                 acc += tiled_rhs_bias.astype(acc.dtype)
 
             acc = apply_act_fn(acc, cfgs.fuse_act)
-
-            # Mask out rows that does not belong to the current group.
-            iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
-            mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
-            acc_masked = jnp.where(mask, acc, 0)
-
-            # Write the final output to the output ref.
-            tiled_out_2d_ref = tiled_out_ref.reshape(-1, cfgs.tiles.tile_n)
-            tiled_out_2d_ref[:acc_m] = acc_masked.astype(tiled_out_ref.dtype)
-
-            # If this is the first tile for grid[n_id, :, :], we initialize the
-            # partial out to zeros. Otherwise, partial out from last tile of
-            # grid[n_id-1, :, :] can be used and cause numeric issues.
-            partial_out_zeros = jnp.zeros_like(partial_out_ref)
-
-            # Accumulate the partial output from the previous step.
-            tiled_out_ref[0] += jnp.where(gm_id == 0, partial_out_zeros,
-                                          partial_out_ref[...])
-
-            # Consider following case where size_lhs_sublane = 4, number denotes group
-            # id and | denotes boundaries between sublanes:
-            # | 0 0 1 2 | 2 2 2 2 | 3 3 4 4 |
-            #
-            # Assuming group id of current step is 1, current step will not completely
-            # fill size_lhs_sublane rows and will be revisited at the next step. By
-            # storing the partial rows into the partial_out_ref, the next step can
-            # read them and accumulate to them.  Additionally, for group id of 2,
-            # since it completely fills the size_lhs_sublane rows, we need to zero out
-            # partial_out_ref to avoid numeric error for group 3.
-            last_row = m_end_local // cfgs.dims.size_lhs_sublane
-            partial_out_ref[...] = jnp.where(
-                m_end_local % cfgs.dims.size_lhs_sublane == 0,
-                partial_out_zeros,
-                tiled_out_ref[last_row],
-            )
+            acc_masked = mask_out_of_group_rows(acc, m_start_local,
+                                                m_end_local)
+            store_output_tile(acc_masked,
+                              tiled_out_ref,
+                              partial_out_ref,
+                              gm_id,
+                              m_end_local,
+                              sublane=cfgs.dims.size_lhs_sublane)
         else:
             acc_ref[:acc_m] = acc
 
