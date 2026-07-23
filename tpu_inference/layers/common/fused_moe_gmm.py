@@ -22,6 +22,7 @@ from jax.sharding import PartitionSpec as P
 
 import tpu_inference.envs as envs
 from tpu_inference.kernels.collectives.hierrs_sc import wrapper as hier_rs_sc
+from tpu_inference.kernels.megablox.gmm_fused import gmm_fused
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
 from tpu_inference.kernels.sparse_core.dense_gather_reduce import \
     dense_gather_reduce
@@ -178,35 +179,70 @@ def moe_gmm_local(x: jax.Array,
                   onehot_moe_permute_threshold: int = 0,
                   scatter_results: bool = False,
                   moe_chunk_size: int = 0,
-                  defer_all_reduce: bool = False) -> jax.Array:
+                  defer_all_reduce: bool = False,
+                  use_fused_gmm: bool = False) -> jax.Array:
     """Main MoE logic on a local shard can run in TP or EP mode.
 
     Set parallelism for "tp" or "ep"
+
+    With use_fused_gmm, the GMM1 -> activation -> GMM2 pair is executed by
+    the single fused kernel (gmm_fused) instead of two gmm_v2 calls,
+    keeping the [tokens, intermediate] activation VMEM-resident. Requires
+    quantized weights, an unpadded intermediate and no GMM biases (all
+    rejected with an error at trace time).
     """
 
     assert parallelism in ["tp", "ep"]
 
-    # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        fuse_act=activation,
-        preferred_element_type=x.dtype,
-    )
+    if use_fused_gmm:
+        assert w1_bias is None and w2_bias is None, (
+            "use_fused_gmm does not support GMM biases; leave w1_bias / "
+            "w2_bias None")
+        if w1.shape[2] != 2 * w2.shape[1]:
+            raise ValueError(
+                "use_fused_gmm requires w1's gate/up intermediate size to "
+                f"match w2's contraction size, got w1 {w1.shape} vs w2 "
+                f"{w2.shape}. A padded intermediate is only supported by the "
+                "two-kernel path; disable the fused MoE kernel for this "
+                "model.")
+        gmm2_res = gmm_fused(
+            lhs=x,
+            w1=w1,
+            w2=w2,
+            group_sizes=group_sizes,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            group_offset=group_offset[0],
+            fuse_act=activation,
+            # Output rows outside the shard's expert window must be zeros,
+            # not uninitialized HBM: the one-hot/dense combine below
+            # contracts over ALL rows, and 0 * NaN would poison the batch.
+            zero_initialize=True,
+        )
+        gmm1_rows = x.shape[0]
+    else:
+        # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            fuse_act=activation,
+            preferred_element_type=x.dtype,
+        )
 
-    # When the parallelism is TP since w2_bias is not sharded, we should only apply bias
-    # once, not applying to every shard. So we set w2_bias to 0 to all shards other than
-    # shard 0. For EP, it is not needed since bias is sharded on leading expert axis.
-    if parallelism == "tp" and w2_bias is not None:
-        shard_id = jax.lax.axis_index(ShardingAxisName.MLP_TENSOR).sum()
-        w2_bias = jnp.where(shard_id == 0, w2_bias, 0)
-    gmm1_res = gmm1_res[:, :w2.shape[1]]  # trim to hidden size if padded
-    gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
-                           group_offset)
+        # When the parallelism is TP since w2_bias is not sharded, we should only apply bias
+        # once, not applying to every shard. So we set w2_bias to 0 to all shards other than
+        # shard 0. For EP, it is not needed since bias is sharded on leading expert axis.
+        if parallelism == "tp" and w2_bias is not None:
+            shard_id = jax.lax.axis_index(ShardingAxisName.MLP_TENSOR).sum()
+            w2_bias = jnp.where(shard_id == 0, w2_bias, 0)
+        gmm1_res = gmm1_res[:, :w2.shape[1]]  # trim to hidden size if padded
+        gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
+                               group_offset)
+        gmm1_rows = gmm1_res.shape[0]
 
     batch_size = gmm2_res.shape[0]
     local_group_size = w1.shape[0]
@@ -263,7 +299,7 @@ def moe_gmm_local(x: jax.Array,
 
     if local_group_size < group_sizes.size:
         mask = valid_rows_mask(
-            gmm1_res.shape[0],
+            gmm1_rows,
             group_sizes,
             group_offset,
             group_offset + local_group_size,
@@ -352,6 +388,7 @@ def tensor_parallel_gmm(
     scatter_results: bool = False,
     moe_chunk_size: int = 0,
     defer_all_reduce: bool = False,
+    use_fused_gmm: bool = False,
 ) -> jax.Array:
     data_p_spec = P(ShardingAxisName.MLP_DATA)
     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
@@ -386,6 +423,7 @@ def tensor_parallel_gmm(
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
             defer_all_reduce=defer_all_reduce,
+            use_fused_gmm=use_fused_gmm,
         ),
         mesh=mesh,
         in_specs=(
@@ -438,6 +476,7 @@ def expert_parallel_gmm(
     moe_chunk_size: int = 0,
     scatter_results: bool = False,
     defer_all_reduce: bool = False,
+    use_fused_gmm: bool = False,
 ) -> jax.Array:
     ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
     ep_p_spec = P(ShardingAxisName.EXPERT)
@@ -471,6 +510,7 @@ def expert_parallel_gmm(
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
             defer_all_reduce=defer_all_reduce,
+            use_fused_gmm=use_fused_gmm,
         ),
         mesh=mesh,
         in_specs=(
@@ -539,6 +579,8 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     "scatter_results",
     "moe_chunk_size",
     "defer_all_reduce",
+    "use_fused_gmm",
+    "use_fused_gmm_min_tokens",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -564,6 +606,8 @@ def fused_moe_func(
     expert_score_correction_bias: jax.Array | None = None,
     moe_chunk_size: int = 0,
     num_valid_tokens: jax.Array | None = None,
+    use_fused_gmm: bool = False,
+    use_fused_gmm_min_tokens: int = 0,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -583,6 +627,12 @@ def fused_moe_func(
         activation: activation function to perform on the output of w1.
         scoring_fn: scoring function to apply on gating_output.
         enable_rs_kernel: enable custom Hierarchical Reduce-Scatter kernel.
+        use_fused_gmm: run GMM1 -> activation -> GMM2 as one fused kernel
+            (gmm_fused). Requires quantized weights and no GMM biases.
+        use_fused_gmm_min_tokens: only use the fused kernel when the global
+            token count is at least this value (0 = always). num_tokens is
+            a trace-time constant, so this selects the kernel per compiled
+            program, like onehot_moe_permute_threshold.
 
     Returns:
         Output of moe operation [num_tokens, hidden_size]
@@ -719,6 +769,10 @@ def fused_moe_func(
             f"Error when padding input hidden states from {hidden_size} to {padded_hidden_size}."
         ) from e
 
+    if (use_fused_gmm and use_fused_gmm_min_tokens > 0
+            and num_tokens < use_fused_gmm_min_tokens):
+        use_fused_gmm = False
+
     if use_ep:
         x = expert_parallel_gmm(
             x,
@@ -739,6 +793,7 @@ def fused_moe_func(
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
             defer_all_reduce=defer_all_reduce,
+            use_fused_gmm=use_fused_gmm,
         )
     else:
         x = tensor_parallel_gmm(
@@ -760,6 +815,7 @@ def fused_moe_func(
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
             defer_all_reduce=defer_all_reduce,
+            use_fused_gmm=use_fused_gmm,
         )
 
     return x[:num_tokens, :hidden_size]

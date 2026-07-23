@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 from flax import nnx
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from vllm.config import ModelConfig, VllmConfig
 
@@ -518,12 +519,30 @@ class TestFp8FusedMoE:
     @pytest.mark.parametrize("num_experts", [8])
     @pytest.mark.parametrize("topk", [2])
     @pytest.mark.parametrize("enable_attn_dp", [False, True])
+    @pytest.mark.parametrize("use_fused_gmm", [False, True])
     def test_fused_moe(self, use_ep, num_devices, num_tokens,
                        intermediate_size, hidden_size, num_experts, topk,
-                       enable_attn_dp, rngs):
+                       enable_attn_dp, use_fused_gmm, rngs, monkeypatch):
         # Skip if enable_attn_dp is True but we don't have enough devices
         if enable_attn_dp and num_devices < 2:
             pytest.skip("enable_attn_dp requires at least 2 devices")
+
+        if use_fused_gmm:
+            # The fused kernel's numerical parity with the two-GMM path is
+            # covered by tests/kernels/gmm_fused_test.py, so at the layer
+            # level only the wiring needs coverage: run it on one shape
+            # combination.
+            if intermediate_size != 2048 or hidden_size != 512:
+                pytest.skip("fused-GMM wiring covered on one shape combo")
+            # The weights are requantized channelwise, so GMM2's quant block
+            # is the per-shard intermediate size (TP shards it); blocks below
+            # the MXU column size are unsupported by gmm_fused.
+            w2_shard_quant_block = intermediate_size // (1 if use_ep else
+                                                         num_devices)
+            if w2_shard_quant_block < pltpu.get_tpu_info().mxu_column_size:
+                pytest.skip("per-shard quant block below the MXU column size")
+            monkeypatch.setenv("MOE_FUSED_GMM", "1")
+            monkeypatch.setenv("MOE_FUSED_GMM_MIN_TOKENS", "0")
 
         mesh = test_utils.get_spmd_mesh(num_devices, enable_attn_dp)
 

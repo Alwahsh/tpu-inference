@@ -76,6 +76,8 @@ if TYPE_CHECKING:
     SLICE_ROPE_CACHE: bool = False
     MIN_TOKEN_BUCKET: int = 16
     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
+    MOE_FUSED_GMM: bool = False
+    MOE_FUSED_GMM_MIN_TOKENS: int = 1024
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     TPU_MESH_SORT_BY_COORDS: bool = False
 
@@ -446,6 +448,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is interleaved per rank and a single valid-token count cannot describe it.
     "MOE_ROUTE_PADDING_TO_EXPERT0":
     env_bool("MOE_ROUTE_PADDING_TO_EXPERT0", default=False),
+    # Run the MoE FFN's GMM1 -> activation -> GMM2 as one fused Pallas
+    # kernel (gmm_fused), keeping the intermediate activation VMEM-resident.
+    # Numerically equivalent to the two-kernel path (see gmm_fused's
+    # documented contract). Requires quantized MoE weights, an unpadded
+    # intermediate and no GMM biases.
+    "MOE_FUSED_GMM":
+    env_bool("MOE_FUSED_GMM", default=False),
+    # Only use the fused MoE kernel when the global token count is at least
+    # this value (0 = always). The token count is a trace-time constant, so
+    # this selects the kernel per compiled program; the default keeps the
+    # fused kernel to prefill-sized batches.
+    "MOE_FUSED_GMM_MIN_TOKENS":
+    lambda: int(os.getenv("MOE_FUSED_GMM_MIN_TOKENS", "1024")),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which

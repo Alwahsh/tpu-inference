@@ -177,6 +177,8 @@ def moe_apply(
                     moe_chunk_size=moe_chunk_size,
                     num_valid_tokens=extra_backend_kwargs.get(
                         "num_valid_tokens", None),
+                    use_fused_gmm=envs.MOE_FUSED_GMM,
+                    use_fused_gmm_min_tokens=envs.MOE_FUSED_GMM_MIN_TOKENS,
                 )
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance
